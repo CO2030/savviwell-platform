@@ -4,7 +4,7 @@
   "type": "module",
   "license": "MIT",
   "scripts": {
-    "dev": "NODE_ENV=development tsx server/index.ts",
+    "dev": "NODE_ENV=development node --env-file=.env --loader tsx server/index.ts",
     "build": "vite build && esbuild server/index.ts --platform=node --packages=external --bundle --format=esm --outdir=dist",
     "build:pages": "GH_PAGES=true vite build",
     "preview": "vite preview --port 5173 --strictPort",
@@ -67,4 +67,13 @@
     "react-day-picker": "^8.10.1",
     "react-dom": "^18.3.1",
     "react-hook-form": "^7.55.0",
-    "react-icons
+    "serve-static": "^1.15.0"
+  },
+  "devDependencies": {
+    "@types/serve-static": "^1.15.7",
+    "esbuild": "^0.21.5",
+    "tsx": "^4.19.1",
+    "typescript": "^5.5.4",
+    "vite": "^5.4.9"
+  }
+}
