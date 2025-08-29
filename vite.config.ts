@@ -4,6 +4,9 @@ import path from "path";
 import runtimeErrorOverlay from "@replit/vite-plugin-runtime-error-modal";
 
 export default defineConfig({
+  // Use a conditional base so local/server hosting uses "/" while
+  // GitHub Pages serves under "/savviwell-platform/".
+  base: process.env.GH_PAGES === "true" ? "/savviwell-platform/" : "/",
   plugins: [
     react(),
     runtimeErrorOverlay(),
