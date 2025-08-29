@@ -23,6 +23,7 @@ type UserProfile = {
 };
 
 const userProfilesById = new Map<number, UserProfile>();
+const nutritionLogsByUserId = new Map<number, { dateIso: string; calories: number; protein: number; carbs: number; fat: number; mealName?: string }[]>();
 const conversationsById = new Map<string, { messages: { role: "user" | "assistant"; content: string }[]; currentPlan?: any }>();
 
 function getOrCreateUserProfile(userId: number): UserProfile {
@@ -347,7 +348,7 @@ Avoid dislikes: ${merged.dislikes.join(", ") || "none"}.
 Respect dietary restrictions: ${merged.dietaryRestrictions.join(", ") || "none"} and allergies: ${merged.allergies.join(", ") || "none"}.
 Prefer favorites when reasonable: ${merged.favorites.join(", ") || "none"}.
 Target per-person daily calories around ${merged.dailyCalorieGoal}. Use shared dishes that suit everyone when possible.
-Return STRICT JSON with shape: [{"day":1, "meals":[{"type":"breakfast|lunch|dinner|snack|dessert|entree|main", "name":"...", "spiciness":"Mild|Medium|Hot", "perPersonCalories": number}]}].`
+Return STRICT JSON with shape: [{"day":1, "meals":[{"type":"breakfast|lunch|dinner|snack|dessert|entree|main", "name":"...", "spiciness":"Mild|Medium|Hot", "perPersonCalories": number, "macros": {"calories": number, "protein": number, "carbs": number, "fat": number}}]}].`
                   },
                 ],
               },
@@ -388,6 +389,30 @@ Return STRICT JSON with shape: [{"day":1, "meals":[{"type":"breakfast|lunch|dinn
         const favorites = merged.favorites;
         const pantryBoost = inMemoryPantry.map((p) => p.itemName.toLowerCase());
         const allergyKeywords = new Set(merged.allergies.map((a) => a.toLowerCase()));
+
+        function estimateMacrosForMeal(name: string, perPersonCalories: number): { calories: number; protein: number; carbs: number; fat: number } {
+          const n = name.toLowerCase();
+          // very rough presets
+          const presets: Record<string, { p: number; c: number; f: number }> = {
+            "grilled chicken": { p: 40, c: 20, f: 12 },
+            "salad": { p: 10, c: 15, f: 10 },
+            "omelette": { p: 20, c: 3, f: 15 },
+            "quinoa": { p: 12, c: 50, f: 9 },
+            "sandwich": { p: 20, c: 45, f: 12 },
+            "yogurt": { p: 18, c: 25, f: 5 },
+            "tofu": { p: 25, c: 15, f: 12 },
+            "curry": { p: 18, c: 45, f: 14 },
+            "oatmeal": { p: 10, c: 55, f: 7 },
+            "lentil": { p: 22, c: 40, f: 5 },
+          };
+          const key = Object.keys(presets).find(k => n.includes(k));
+          if (key) {
+            const { p, c, f } = presets[key];
+            const calories = perPersonCalories;
+            return { calories, protein: p, carbs: c, fat: f };
+          }
+          return { calories: perPersonCalories, protein: 20, carbs: 40, fat: 12 };
+        }
 
         function pickMeals(count: number, used: Set<string>, dayIndex: number): { name: string; type: string; spiciness: "Mild" | "Medium" | "Hot" }[] {
           const candidates = [
@@ -431,7 +456,8 @@ Return STRICT JSON with shape: [{"day":1, "meals":[{"type":"breakfast|lunch|dinn
         plan = Array.from({ length: planDays }, (_v, i) => {
           const used = new Set<string>();
           const mealsPicked = pickMeals(mealsEachDay, used, i);
-          const meals = mealsPicked.map((m) => ({ type: m.type, name: m.name, spiciness: m.spiciness, perPersonCalories: Math.round(merged.dailyCalorieGoal / mealsEachDay) }));
+          const perPerson = Math.round(merged.dailyCalorieGoal / mealsEachDay);
+          const meals = mealsPicked.map((m) => ({ type: m.type, name: m.name, spiciness: m.spiciness, perPersonCalories: perPerson, macros: estimateMacrosForMeal(m.name, perPerson) }));
           const familySwaps = meals.map((m) => {
             const exclude = new Set([m.name.toLowerCase(), ...mealsPicked.map((x) => x.name.toLowerCase())]);
             const perUser = profiles.map((p) => ({
@@ -492,6 +518,42 @@ Return STRICT JSON with shape: [{"day":1, "meals":[{"type":"breakfast|lunch|dinn
     const exclude = new Set<string>([mealName.toLowerCase()]);
     const swaps = generateAlternatives(profile, profile.favorites, mealBank, pantryBoost, exclude, 5);
     res.json({ success: true, swaps });
+  });
+
+  // --- Nutrition: estimate and log ---
+  app.post("/api/nutrition/estimate", (req: Request, res: Response) => {
+    const { mealName, perPersonCalories } = req.body as { mealName?: string; perPersonCalories?: number };
+    if (!mealName || !perPersonCalories) return res.status(400).json({ message: "mealName and perPersonCalories required" });
+    const calories = Math.max(100, Math.min(1200, Math.round(perPersonCalories)));
+    const estimate = {
+      calories,
+      protein: Math.round((calories * 0.2) / 4),
+      carbs: Math.round((calories * 0.5) / 4),
+      fat: Math.round((calories * 0.3) / 9),
+    };
+    res.json({ success: true, macros: estimate });
+  });
+
+  app.post("/api/nutrition/log-meal", (req: Request, res: Response) => {
+    const { userId, mealName, macros } = req.body as { userId?: number; mealName?: string; macros?: { calories: number; protein: number; carbs: number; fat: number } };
+    if (!userId || !mealName || !macros) return res.status(400).json({ message: "userId, mealName, macros required" });
+    const list = nutritionLogsByUserId.get(Number(userId)) ?? [];
+    const entry = { dateIso: new Date().toISOString(), calories: macros.calories, protein: macros.protein, carbs: macros.carbs, fat: macros.fat, mealName };
+    list.push(entry);
+    nutritionLogsByUserId.set(Number(userId), list);
+    res.status(201).json({ success: true });
+  });
+
+  app.get("/api/nutrition/today", (req: Request, res: Response) => {
+    const userId = Number(req.query.userId);
+    if (!userId) return res.status(400).json({ message: "userId required" });
+    const list = nutritionLogsByUserId.get(userId) ?? [];
+    const today = new Date().toISOString().slice(0, 10);
+    const todayEntries = list.filter(e => e.dateIso.slice(0, 10) === today);
+    const totals = todayEntries.reduce((acc, e) => {
+      acc.calories += e.calories; acc.protein += e.protein; acc.carbs += e.carbs; acc.fat += e.fat; return acc;
+    }, { calories: 0, protein: 0, carbs: 0, fat: 0 });
+    res.json({ success: true, totals, entries: todayEntries });
   });
 
   // --- Sync current plan into a conversation (when generated on client) ---
