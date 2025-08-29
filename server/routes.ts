@@ -60,6 +60,53 @@ function getOpenAIClient() {
   return apiKey ? new OpenAI({ apiKey }) : undefined;
 }
 
+// --- Shared dietary/allergy helpers ---
+const restrictionKeywords: Record<string, string[]> = {
+  vegetarian: ["chicken", "turkey", "salmon", "beef", "pork", "fish"],
+  vegan: ["chicken", "turkey", "salmon", "beef", "pork", "fish", "yogurt", "omelette", "egg", "eggs", "cheese"],
+  "gluten-free": ["sandwich", "bread", "bun", "pasta"],
+  dairy_free: ["yogurt", "cheese"],
+};
+
+function violatesProfile(mealName: string, profile: UserProfile): boolean {
+  const name = mealName.toLowerCase();
+  if (profile.dislikes.some((d) => name.includes(d.toLowerCase()))) return true;
+  for (const r of profile.dietaryRestrictions) {
+    const words = restrictionKeywords[r.toLowerCase()];
+    if (words && words.some((w) => name.includes(w))) return true;
+  }
+  if (profile.allergies.some((a) => name.includes(a.toLowerCase()))) return true;
+  return false;
+}
+
+function generateAlternatives(
+  profile: UserProfile,
+  favorites: string[],
+  mealBank: string[],
+  pantryBoost: string[],
+  exclude: Set<string>,
+  max: number,
+): string[] {
+  const candidates = [
+    ...favorites,
+    ...mealBank.filter((m) => !favorites.find((f) => f.toLowerCase() === m.toLowerCase())),
+  ]
+    .filter((m) => !violatesProfile(m, profile))
+    .filter((m) => !exclude.has(m.toLowerCase()))
+    .sort((a, b) => {
+      const aScore = pantryBoost.some((i) => a.toLowerCase().includes(i)) ? 1 : 0;
+      const bScore = pantryBoost.some((i) => b.toLowerCase().includes(i)) ? 1 : 0;
+      return bScore - aScore;
+    });
+
+  const picks: string[] = [];
+  for (let i = 0; i < candidates.length && picks.length < max; i++) {
+    const choice = candidates[i];
+    if (!picks.find((p) => p.toLowerCase() === choice.toLowerCase())) picks.push(choice);
+  }
+  return picks;
+}
+
 export async function registerRoutes(app: Express): Promise<void> {
   // Health
   app.get("/api/health", (_req: Request, res: Response) => {
@@ -266,25 +313,7 @@ Return STRICT JSON with shape: [{"day":1, "meals":[{"type":"breakfast|lunch|dinn
         const avoid = new Set(merged.dislikes.map((x) => x.toLowerCase()));
         const favorites = merged.favorites;
         const pantryBoost = inMemoryPantry.map((p) => p.itemName.toLowerCase());
-        const restrictionKeywords: Record<string, string[]> = {
-          vegetarian: ["chicken", "turkey", "salmon", "beef", "pork", "fish"],
-          vegan: ["chicken", "turkey", "salmon", "beef", "pork", "fish", "yogurt", "omelette", "egg", "eggs"],
-          "gluten-free": ["sandwich", "bread", "bun", "pasta"],
-          dairy_free: ["yogurt", "cheese"],
-        };
         const allergyKeywords = new Set(merged.allergies.map((a) => a.toLowerCase()));
-
-        function violatesRestrictions(mealName: string): boolean {
-          const name = mealName.toLowerCase();
-          for (const r of merged.dietaryRestrictions) {
-            const key = r.toLowerCase();
-            const words = restrictionKeywords[key];
-            if (words && words.some((w) => name.includes(w))) return true;
-          }
-          // Simple allergy filter by substring
-          if ([...allergyKeywords].some((w) => name.includes(w))) return true;
-          return false;
-        }
 
         function pickMeals(count: number, used: Set<string>): string[] {
           const candidates = [
@@ -292,7 +321,15 @@ Return STRICT JSON with shape: [{"day":1, "meals":[{"type":"breakfast|lunch|dinn
             ...mealBank.filter((m) => !favorites.find((f) => f.toLowerCase() === m.toLowerCase())),
           ]
             .filter((m) => ![...avoid].some((a) => m.toLowerCase().includes(a)))
-            .filter((m) => !violatesRestrictions(m))
+            .filter((m) => {
+              const name = m.toLowerCase();
+              for (const r of merged.dietaryRestrictions) {
+                const words = restrictionKeywords[r.toLowerCase()];
+                if (words && words.some((w) => name.includes(w))) return false;
+              }
+              if ([...allergyKeywords].some((w) => name.includes(w))) return false;
+              return true;
+            })
             .sort((a, b) => {
               const aScore = pantryBoost.some((i) => a.toLowerCase().includes(i)) ? 1 : 0;
               const bScore = pantryBoost.some((i) => b.toLowerCase().includes(i)) ? 1 : 0;
@@ -317,10 +354,16 @@ Return STRICT JSON with shape: [{"day":1, "meals":[{"type":"breakfast|lunch|dinn
           const used = new Set<string>();
           const names = pickMeals(mealsEachDay, used);
           const types = ["breakfast", "lunch", "dinner", "snack", "snack"]; // enough types
-          return {
-            day: i + 1,
-            meals: names.map((n, idx) => ({ type: types[idx], name: n, perPersonCalories: Math.round(merged.dailyCalorieGoal / mealsEachDay) })),
-          };
+          const meals = names.map((n, idx) => ({ type: types[idx], name: n, perPersonCalories: Math.round(merged.dailyCalorieGoal / mealsEachDay) }));
+          const familySwaps = meals.map((m) => {
+            const exclude = new Set([m.name.toLowerCase(), ...names.map((x) => x.toLowerCase())]);
+            const perUser = profiles.map((p) => ({
+              userId: p.userId,
+              swaps: generateAlternatives(p, p.favorites, mealBank, pantryBoost, exclude, 3),
+            }));
+            return { forMeal: m.name, alternatives: perUser };
+          });
+          return { day: i + 1, meals, swaps: familySwaps };
         });
       }
 
@@ -344,6 +387,29 @@ Return STRICT JSON with shape: [{"day":1, "meals":[{"type":"breakfast|lunch|dinn
     profile.updatedAt = new Date().toISOString();
     userProfilesById.set(profile.userId, profile);
     res.json({ success: true, profile });
+  });
+
+  // --- Swap suggestions on demand ---
+  app.post("/api/meal-plan/swaps", (req: Request, res: Response) => {
+    const { userId, mealName } = req.body as { userId?: number; mealName?: string };
+    if (!userId || !mealName) return res.status(400).json({ message: "userId and mealName are required" });
+    const profile = getOrCreateUserProfile(Number(userId));
+    const mealBank = [
+      "Grilled chicken salad",
+      "Veggie omelette",
+      "Quinoa bowl with roasted vegetables",
+      "Turkey sandwich on whole grain",
+      "Greek yogurt with berries",
+      "Tofu stir-fry",
+      "Salmon with brown rice",
+      "Chickpea curry",
+      "Oatmeal with banana",
+      "Lentil soup",
+    ];
+    const pantryBoost = inMemoryPantry.map((p) => p.itemName.toLowerCase());
+    const exclude = new Set<string>([mealName.toLowerCase()]);
+    const swaps = generateAlternatives(profile, profile.favorites, mealBank, pantryBoost, exclude, 5);
+    res.json({ success: true, swaps });
   });
 
   return;
