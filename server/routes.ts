@@ -1,6 +1,7 @@
 import type { Express, Request, Response } from "express";
 import OpenAI from "openai";
 import { log } from "./vite";
+import { usdaEstimateMacros, usdaSearchFoods } from "./usda";
 
 type PantryScanItem = {
   itemName: string;
@@ -524,14 +525,37 @@ Return STRICT JSON with shape: [{"day":1, "meals":[{"type":"breakfast|lunch|dinn
   app.post("/api/nutrition/estimate", (req: Request, res: Response) => {
     const { mealName, perPersonCalories } = req.body as { mealName?: string; perPersonCalories?: number };
     if (!mealName || !perPersonCalories) return res.status(400).json({ message: "mealName and perPersonCalories required" });
-    const calories = Math.max(100, Math.min(1200, Math.round(perPersonCalories)));
-    const estimate = {
-      calories,
-      protein: Math.round((calories * 0.2) / 4),
-      carbs: Math.round((calories * 0.5) / 4),
-      fat: Math.round((calories * 0.3) / 9),
-    };
-    res.json({ success: true, macros: estimate });
+    (async () => {
+      try {
+        if (process.env.USDA_API_KEY) {
+          const macros = await usdaEstimateMacros(mealName);
+          if (macros) return res.json({ success: true, macros });
+        }
+      } catch (e) {
+        log(`USDA estimate failed: ${String(e)}`);
+      }
+
+      const calories = Math.max(100, Math.min(1200, Math.round(perPersonCalories)));
+      const estimate = {
+        calories,
+        protein: Math.round((calories * 0.2) / 4),
+        carbs: Math.round((calories * 0.5) / 4),
+        fat: Math.round((calories * 0.3) / 9),
+      };
+      res.json({ success: true, macros: estimate });
+    })();
+  });
+
+  app.get("/api/nutrition/search", async (req: Request, res: Response) => {
+    try {
+      const q = String(req.query.q || "").trim();
+      if (!q) return res.status(400).json({ message: "q required" });
+      if (!process.env.USDA_API_KEY) return res.status(400).json({ message: "USDA_API_KEY not set" });
+      const results = await usdaSearchFoods(q, 10);
+      res.json({ success: true, results });
+    } catch (e: any) {
+      res.status(500).json({ message: e?.message ?? "search failed" });
+    }
   });
 
   app.post("/api/nutrition/log-meal", (req: Request, res: Response) => {
