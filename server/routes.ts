@@ -197,12 +197,21 @@ export async function registerRoutes(app: Express): Promise<void> {
   // --- Meal Planner ---
   app.post("/api/meal-plan/generate", async (req: Request, res: Response) => {
     try {
-      const { userId, days, mealsPerDay } = req.body as { userId?: number; days?: number; mealsPerDay?: number };
-      if (!userId || Number.isNaN(Number(userId))) return res.status(400).json({ message: "userId is required" });
+      const { userId, userIds, days, mealsPerDay } = req.body as { userId?: number; userIds?: number[]; days?: number; mealsPerDay?: number };
+      const audience = Array.isArray(userIds) && userIds.length > 0 ? userIds.map(Number) : [Number(userId)];
+      if (!audience.length || audience.some((id) => !id || Number.isNaN(id))) return res.status(400).json({ message: "userId or userIds required" });
       const planDays = Math.min(Math.max(days ?? 7, 1), 14);
       const mealsEachDay = Math.min(Math.max(mealsPerDay ?? 3, 1), 5);
 
-      const profile = getOrCreateUserProfile(Number(userId));
+      const profiles = audience.map((id) => getOrCreateUserProfile(id));
+      const merged = (function mergeProfiles(ps: UserProfile[]) {
+        const dislikes = Array.from(new Set(ps.flatMap((p) => p.dislikes.map((x) => x.toLowerCase()))));
+        const dietaryRestrictions = Array.from(new Set(ps.flatMap((p) => p.dietaryRestrictions.map((x) => x.toLowerCase()))));
+        const allergies = Array.from(new Set(ps.flatMap((p) => p.allergies.map((x) => x.toLowerCase()))));
+        const favorites = Array.from(new Set(ps.flatMap((p) => p.favorites)));
+        const dailyCalorieGoal = Math.round(ps.reduce((sum, p) => sum + (p.dailyCalorieGoal || 2000), 0) / ps.length);
+        return { dislikes, dietaryRestrictions, allergies, favorites, dailyCalorieGoal };
+      })(profiles);
       const openai = getOpenAIClient();
 
       let plan: any = null;
@@ -217,12 +226,12 @@ export async function registerRoutes(app: Express): Promise<void> {
                 content: [
                   {
                     type: "input_text",
-                    text: `Create a ${planDays}-day meal plan with ${mealsEachDay} meals per day.
-Avoid these dislikes: ${profile.dislikes.join(", ") || "none"}.
-Respect dietary restrictions: ${profile.dietaryRestrictions.join(", ") || "none"} and allergies: ${profile.allergies.join(", ") || "none"}.
-Prefer these favorites when reasonable: ${profile.favorites.join(", ") || "none"}.
-Target daily calories around ${profile.dailyCalorieGoal}.
-Return STRICT JSON with shape: [{"day":1, "meals":[{"type":"breakfast|lunch|dinner|snack", "name":"...", "calories": number}]}].`
+                    text: `Create a ${planDays}-day meal plan with ${mealsEachDay} meals per day for ${profiles.length} people.
+Avoid dislikes: ${merged.dislikes.join(", ") || "none"}.
+Respect dietary restrictions: ${merged.dietaryRestrictions.join(", ") || "none"} and allergies: ${merged.allergies.join(", ") || "none"}.
+Prefer favorites when reasonable: ${merged.favorites.join(", ") || "none"}.
+Target per-person daily calories around ${merged.dailyCalorieGoal}. Use shared dishes that suit everyone when possible.
+Return STRICT JSON with shape: [{"day":1, "meals":[{"type":"breakfast|lunch|dinner|snack", "name":"...", "perPersonCalories": number}]}].`
                   },
                 ],
               },
@@ -241,7 +250,7 @@ Return STRICT JSON with shape: [{"day":1, "meals":[{"type":"breakfast|lunch|dinn
       }
 
       if (!plan) {
-        // Fallback simple generator using favorites/dislikes
+        // Fallback dynamic generator using favorites/dislikes, pantry, and restrictions
         const mealBank = [
           "Grilled chicken salad",
           "Veggie omelette",
@@ -254,27 +263,63 @@ Return STRICT JSON with shape: [{"day":1, "meals":[{"type":"breakfast|lunch|dinn
           "Oatmeal with banana",
           "Lentil soup",
         ];
-        const avoid = new Set(profile.dislikes.map((x) => x.toLowerCase()));
-        const favorites = profile.favorites;
+        const avoid = new Set(merged.dislikes.map((x) => x.toLowerCase()));
+        const favorites = merged.favorites;
+        const pantryBoost = inMemoryPantry.map((p) => p.itemName.toLowerCase());
+        const restrictionKeywords: Record<string, string[]> = {
+          vegetarian: ["chicken", "turkey", "salmon", "beef", "pork", "fish"],
+          vegan: ["chicken", "turkey", "salmon", "beef", "pork", "fish", "yogurt", "omelette", "egg", "eggs"],
+          "gluten-free": ["sandwich", "bread", "bun", "pasta"],
+          dairy_free: ["yogurt", "cheese"],
+        };
+        const allergyKeywords = new Set(merged.allergies.map((a) => a.toLowerCase()));
 
-        function pickMeals(count: number): string[] {
+        function violatesRestrictions(mealName: string): boolean {
+          const name = mealName.toLowerCase();
+          for (const r of merged.dietaryRestrictions) {
+            const key = r.toLowerCase();
+            const words = restrictionKeywords[key];
+            if (words && words.some((w) => name.includes(w))) return true;
+          }
+          // Simple allergy filter by substring
+          if ([...allergyKeywords].some((w) => name.includes(w))) return true;
+          return false;
+        }
+
+        function pickMeals(count: number, used: Set<string>): string[] {
           const candidates = [
             ...favorites,
             ...mealBank.filter((m) => !favorites.find((f) => f.toLowerCase() === m.toLowerCase())),
-          ].filter((m) => ![...avoid].some((a) => m.toLowerCase().includes(a)));
+          ]
+            .filter((m) => ![...avoid].some((a) => m.toLowerCase().includes(a)))
+            .filter((m) => !violatesRestrictions(m))
+            .sort((a, b) => {
+              const aScore = pantryBoost.some((i) => a.toLowerCase().includes(i)) ? 1 : 0;
+              const bScore = pantryBoost.some((i) => b.toLowerCase().includes(i)) ? 1 : 0;
+              return bScore - aScore;
+            });
           const picked: string[] = [];
           for (let i = 0; i < count; i++) {
-            picked.push(candidates[(i + Math.floor(Math.random() * candidates.length)) % candidates.length] ?? "Chef's choice");
+            let attempt = 0;
+            let choice = "Chef's choice";
+            while (attempt < candidates.length) {
+              const c = candidates[(i + Math.floor(Math.random() * candidates.length) + attempt) % candidates.length] ?? "Chef's choice";
+              if (!used.has(c.toLowerCase())) { choice = c; break; }
+              attempt++;
+            }
+            picked.push(choice);
+            used.add(choice.toLowerCase());
           }
           return picked;
         }
 
         plan = Array.from({ length: planDays }, (_v, i) => {
-          const names = pickMeals(mealsEachDay);
+          const used = new Set<string>();
+          const names = pickMeals(mealsEachDay, used);
           const types = ["breakfast", "lunch", "dinner", "snack", "snack"]; // enough types
           return {
             day: i + 1,
-            meals: names.map((n, idx) => ({ type: types[idx], name: n, calories: Math.round(profile.dailyCalorieGoal / mealsEachDay) })),
+            meals: names.map((n, idx) => ({ type: types[idx], name: n, perPersonCalories: Math.round(merged.dailyCalorieGoal / mealsEachDay) })),
           };
         });
       }
