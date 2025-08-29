@@ -12,6 +12,49 @@ type PantryScanItem = {
 
 const inMemoryPantry: PantryScanItem[] = [];
 
+type UserProfile = {
+  userId: number;
+  dailyCalorieGoal: number;
+  dietaryRestrictions: string[];
+  allergies: string[];
+  dislikes: string[];
+  favorites: string[];
+  updatedAt: string;
+};
+
+const userProfilesById = new Map<number, UserProfile>();
+
+function getOrCreateUserProfile(userId: number): UserProfile {
+  const existing = userProfilesById.get(userId);
+  if (existing) return existing;
+
+  const created: UserProfile = {
+    userId,
+    dailyCalorieGoal: 2000,
+    dietaryRestrictions: [],
+    allergies: [],
+    dislikes: [],
+    favorites: [],
+    updatedAt: new Date().toISOString(),
+  };
+  userProfilesById.set(userId, created);
+  return created;
+}
+
+function addUnique(list: string[], value: string): string[] {
+  const v = value.trim();
+  if (!v) return list;
+  if (!list.find((x) => x.toLowerCase() === v.toLowerCase())) {
+    return [...list, v];
+  }
+  return list;
+}
+
+function removeValue(list: string[], value: string): string[] {
+  const v = value.trim().toLowerCase();
+  return list.filter((x) => x.toLowerCase() !== v);
+}
+
 function getOpenAIClient() {
   const apiKey = process.env.OPENAI_API_KEY;
   return apiKey ? new OpenAI({ apiKey }) : undefined;
@@ -126,6 +169,136 @@ export async function registerRoutes(app: Express): Promise<void> {
     if (!item?.itemName) return res.status(400).json({ message: "itemName is required" });
     inMemoryPantry.push({ ...item, quantity: item.quantity ?? 1, unit: item.unit ?? "pieces" });
     res.status(201).json({ success: true });
+  });
+
+  // --- User Profiles ---
+  app.get("/api/user-profiles/:userId", (req: Request, res: Response) => {
+    const userId = Number(req.params.userId);
+    if (Number.isNaN(userId)) return res.status(400).json({ message: "invalid userId" });
+    const profile = getOrCreateUserProfile(userId);
+    res.json({ profile });
+  });
+
+  app.put("/api/user-profiles/:userId", (req: Request, res: Response) => {
+    const userId = Number(req.params.userId);
+    if (Number.isNaN(userId)) return res.status(400).json({ message: "invalid userId" });
+    const profile = getOrCreateUserProfile(userId);
+    const { dailyCalorieGoal, dietaryRestrictions, allergies, dislikes, favorites } = req.body as Partial<UserProfile>;
+    if (typeof dailyCalorieGoal === "number") profile.dailyCalorieGoal = dailyCalorieGoal;
+    if (Array.isArray(dietaryRestrictions)) profile.dietaryRestrictions = dietaryRestrictions;
+    if (Array.isArray(allergies)) profile.allergies = allergies;
+    if (Array.isArray(dislikes)) profile.dislikes = dislikes;
+    if (Array.isArray(favorites)) profile.favorites = favorites;
+    profile.updatedAt = new Date().toISOString();
+    userProfilesById.set(userId, profile);
+    res.json({ success: true, profile });
+  });
+
+  // --- Meal Planner ---
+  app.post("/api/meal-plan/generate", async (req: Request, res: Response) => {
+    try {
+      const { userId, days, mealsPerDay } = req.body as { userId?: number; days?: number; mealsPerDay?: number };
+      if (!userId || Number.isNaN(Number(userId))) return res.status(400).json({ message: "userId is required" });
+      const planDays = Math.min(Math.max(days ?? 7, 1), 14);
+      const mealsEachDay = Math.min(Math.max(mealsPerDay ?? 3, 1), 5);
+
+      const profile = getOrCreateUserProfile(Number(userId));
+      const openai = getOpenAIClient();
+
+      let plan: any = null;
+
+      if (openai) {
+        try {
+          const response = await openai.responses.create({
+            model: "gpt-4.1-mini",
+            input: [
+              {
+                role: "user",
+                content: [
+                  {
+                    type: "input_text",
+                    text: `Create a ${planDays}-day meal plan with ${mealsEachDay} meals per day.
+Avoid these dislikes: ${profile.dislikes.join(", ") || "none"}.
+Respect dietary restrictions: ${profile.dietaryRestrictions.join(", ") || "none"} and allergies: ${profile.allergies.join(", ") || "none"}.
+Prefer these favorites when reasonable: ${profile.favorites.join(", ") || "none"}.
+Target daily calories around ${profile.dailyCalorieGoal}.
+Return STRICT JSON with shape: [{"day":1, "meals":[{"type":"breakfast|lunch|dinner|snack", "name":"...", "calories": number}]}].`
+                  },
+                ],
+              },
+            ],
+            temperature: 0.3,
+          });
+
+          const text = response.output_text ?? "";
+          const jsonMatch = text.match(/\[[\s\S]*\]/);
+          if (jsonMatch) {
+            plan = JSON.parse(jsonMatch[0]);
+          }
+        } catch (err) {
+          log(`openai meal-plan failed: ${String(err)}`);
+        }
+      }
+
+      if (!plan) {
+        // Fallback simple generator using favorites/dislikes
+        const mealBank = [
+          "Grilled chicken salad",
+          "Veggie omelette",
+          "Quinoa bowl with roasted vegetables",
+          "Turkey sandwich on whole grain",
+          "Greek yogurt with berries",
+          "Tofu stir-fry",
+          "Salmon with brown rice",
+          "Chickpea curry",
+          "Oatmeal with banana",
+          "Lentil soup",
+        ];
+        const avoid = new Set(profile.dislikes.map((x) => x.toLowerCase()));
+        const favorites = profile.favorites;
+
+        function pickMeals(count: number): string[] {
+          const candidates = [
+            ...favorites,
+            ...mealBank.filter((m) => !favorites.find((f) => f.toLowerCase() === m.toLowerCase())),
+          ].filter((m) => ![...avoid].some((a) => m.toLowerCase().includes(a)));
+          const picked: string[] = [];
+          for (let i = 0; i < count; i++) {
+            picked.push(candidates[(i + Math.floor(Math.random() * candidates.length)) % candidates.length] ?? "Chef's choice");
+          }
+          return picked;
+        }
+
+        plan = Array.from({ length: planDays }, (_v, i) => {
+          const names = pickMeals(mealsEachDay);
+          const types = ["breakfast", "lunch", "dinner", "snack", "snack"]; // enough types
+          return {
+            day: i + 1,
+            meals: names.map((n, idx) => ({ type: types[idx], name: n, calories: Math.round(profile.dailyCalorieGoal / mealsEachDay) })),
+          };
+        });
+      }
+
+      res.json({ success: true, plan });
+    } catch (error: any) {
+      res.status(500).json({ message: error?.message ?? "meal plan generation failed" });
+    }
+  });
+
+  app.post("/api/meal-plan/feedback", (req: Request, res: Response) => {
+    const { userId, mealName, action } = req.body as { userId?: number; mealName?: string; action?: "like" | "dislike" };
+    if (!userId || !mealName || !action) return res.status(400).json({ message: "userId, mealName and action are required" });
+    const profile = getOrCreateUserProfile(Number(userId));
+    if (action === "like") {
+      profile.favorites = addUnique(profile.favorites, mealName);
+      profile.dislikes = removeValue(profile.dislikes, mealName);
+    } else if (action === "dislike") {
+      profile.dislikes = addUnique(profile.dislikes, mealName);
+      profile.favorites = removeValue(profile.favorites, mealName);
+    }
+    profile.updatedAt = new Date().toISOString();
+    userProfilesById.set(profile.userId, profile);
+    res.json({ success: true, profile });
   });
 
   return;
