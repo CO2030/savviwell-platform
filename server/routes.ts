@@ -118,6 +118,14 @@ export async function registerRoutes(app: Express): Promise<void> {
     res.json({ items: inMemoryPantry });
   });
 
+  // Meal planner options
+  app.get("/api/meal-plan/options", (_req: Request, res: Response) => {
+    res.json({
+      mealTypes: ["breakfast", "lunch", "dinner", "snack", "dessert", "entree", "main"],
+      spiciness: ["Mild", "Medium", "Hot"],
+    });
+  });
+
   // Pantry scan
   app.post("/api/pantry/scan", async (req: Request, res: Response) => {
     try {
@@ -244,11 +252,23 @@ export async function registerRoutes(app: Express): Promise<void> {
   // --- Meal Planner ---
   app.post("/api/meal-plan/generate", async (req: Request, res: Response) => {
     try {
-      const { userId, userIds, days, mealsPerDay } = req.body as { userId?: number; userIds?: number[]; days?: number; mealsPerDay?: number };
+      const { userId, userIds, days, mealsPerDay, mealTypes, spiciness, cuisine } = req.body as {
+        userId?: number;
+        userIds?: number[];
+        days?: number;
+        mealsPerDay?: number;
+        mealTypes?: string[];
+        spiciness?: "Mild" | "Medium" | "Hot";
+        cuisine?: string;
+      };
       const audience = Array.isArray(userIds) && userIds.length > 0 ? userIds.map(Number) : [Number(userId)];
       if (!audience.length || audience.some((id) => !id || Number.isNaN(id))) return res.status(400).json({ message: "userId or userIds required" });
       const planDays = Math.min(Math.max(days ?? 7, 1), 14);
       const mealsEachDay = Math.min(Math.max(mealsPerDay ?? 3, 1), 5);
+      const allowedMealTypes = Array.isArray(mealTypes) && mealTypes.length > 0
+        ? mealTypes.map((t) => t.toLowerCase())
+        : ["breakfast", "lunch", "dinner", "snack"];
+      const spiceLevel: "Mild" | "Medium" | "Hot" = (spiciness === "Mild" || spiciness === "Medium" || spiciness === "Hot") ? spiciness : "Mild";
 
       const profiles = audience.map((id) => getOrCreateUserProfile(id));
       const merged = (function mergeProfiles(ps: UserProfile[]) {
@@ -274,11 +294,13 @@ export async function registerRoutes(app: Express): Promise<void> {
                   {
                     type: "input_text",
                     text: `Create a ${planDays}-day meal plan with ${mealsEachDay} meals per day for ${profiles.length} people.
+Cuisine preference: ${cuisine || "any"}.
+Only use meal types from this set: ${allowedMealTypes.join(", ")}. Respect spiciness level: ${spiceLevel}.
 Avoid dislikes: ${merged.dislikes.join(", ") || "none"}.
 Respect dietary restrictions: ${merged.dietaryRestrictions.join(", ") || "none"} and allergies: ${merged.allergies.join(", ") || "none"}.
 Prefer favorites when reasonable: ${merged.favorites.join(", ") || "none"}.
 Target per-person daily calories around ${merged.dailyCalorieGoal}. Use shared dishes that suit everyone when possible.
-Return STRICT JSON with shape: [{"day":1, "meals":[{"type":"breakfast|lunch|dinner|snack", "name":"...", "perPersonCalories": number}]}].`
+Return STRICT JSON with shape: [{"day":1, "meals":[{"type":"breakfast|lunch|dinner|snack|dessert|entree|main", "name":"...", "spiciness":"Mild|Medium|Hot", "perPersonCalories": number}]}].`
                   },
                 ],
               },
@@ -297,25 +319,30 @@ Return STRICT JSON with shape: [{"day":1, "meals":[{"type":"breakfast|lunch|dinn
       }
 
       if (!plan) {
-        // Fallback dynamic generator using favorites/dislikes, pantry, and restrictions
-        const mealBank = [
-          "Grilled chicken salad",
-          "Veggie omelette",
-          "Quinoa bowl with roasted vegetables",
-          "Turkey sandwich on whole grain",
-          "Greek yogurt with berries",
-          "Tofu stir-fry",
-          "Salmon with brown rice",
-          "Chickpea curry",
-          "Oatmeal with banana",
-          "Lentil soup",
+        // Fallback dynamic generator using favorites/dislikes, pantry, restrictions, meal types, and spiciness
+        const MEAL_CATALOG: { name: string; type: string; spice: 0 | 1 | 2 }[] = [
+          { name: "Grilled chicken salad", type: "dinner", spice: 0 },
+          { name: "Veggie omelette", type: "breakfast", spice: 0 },
+          { name: "Quinoa bowl with roasted vegetables", type: "lunch", spice: 0 },
+          { name: "Turkey sandwich on whole grain", type: "lunch", spice: 0 },
+          { name: "Greek yogurt with berries", type: "snack", spice: 0 },
+          { name: "Tofu stir-fry", type: "dinner", spice: 1 },
+          { name: "Salmon with brown rice", type: "dinner", spice: 0 },
+          { name: "Chickpea curry", type: "dinner", spice: 2 },
+          { name: "Oatmeal with banana", type: "breakfast", spice: 0 },
+          { name: "Lentil soup", type: "lunch", spice: 0 },
+          { name: "Fruit salad", type: "dessert", spice: 0 },
+          { name: "Hummus and veggies", type: "snack", spice: 0 },
         ];
+        const spiceMax = spiceLevel === "Mild" ? 0 : spiceLevel === "Medium" ? 1 : 2;
+        const filteredCatalog = MEAL_CATALOG.filter((m) => allowedMealTypes.includes(m.type)).filter((m) => m.spice <= spiceMax);
+        const mealBank = filteredCatalog.map((m) => m.name);
         const avoid = new Set(merged.dislikes.map((x) => x.toLowerCase()));
         const favorites = merged.favorites;
         const pantryBoost = inMemoryPantry.map((p) => p.itemName.toLowerCase());
         const allergyKeywords = new Set(merged.allergies.map((a) => a.toLowerCase()));
 
-        function pickMeals(count: number, used: Set<string>): string[] {
+        function pickMeals(count: number, used: Set<string>, dayIndex: number): { name: string; type: string; spiciness: "Mild" | "Medium" | "Hot" }[] {
           const candidates = [
             ...favorites,
             ...mealBank.filter((m) => !favorites.find((f) => f.toLowerCase() === m.toLowerCase())),
@@ -335,7 +362,7 @@ Return STRICT JSON with shape: [{"day":1, "meals":[{"type":"breakfast|lunch|dinn
               const bScore = pantryBoost.some((i) => b.toLowerCase().includes(i)) ? 1 : 0;
               return bScore - aScore;
             });
-          const picked: string[] = [];
+          const picked: { name: string; type: string; spiciness: "Mild" | "Medium" | "Hot" }[] = [];
           for (let i = 0; i < count; i++) {
             let attempt = 0;
             let choice = "Chef's choice";
@@ -344,19 +371,22 @@ Return STRICT JSON with shape: [{"day":1, "meals":[{"type":"breakfast|lunch|dinn
               if (!used.has(c.toLowerCase())) { choice = c; break; }
               attempt++;
             }
-            picked.push(choice);
             used.add(choice.toLowerCase());
+            const found = filteredCatalog.find((m) => m.name.toLowerCase() === choice.toLowerCase());
+            const fallbackType = allowedMealTypes[i % allowedMealTypes.length] || "dinner";
+            const type = found?.type ?? fallbackType;
+            const s: "Mild" | "Medium" | "Hot" = found ? (found.spice === 0 ? "Mild" : found.spice === 1 ? "Medium" : "Hot") : spiceLevel;
+            picked.push({ name: choice, type, spiciness: s });
           }
           return picked;
         }
 
         plan = Array.from({ length: planDays }, (_v, i) => {
           const used = new Set<string>();
-          const names = pickMeals(mealsEachDay, used);
-          const types = ["breakfast", "lunch", "dinner", "snack", "snack"]; // enough types
-          const meals = names.map((n, idx) => ({ type: types[idx], name: n, perPersonCalories: Math.round(merged.dailyCalorieGoal / mealsEachDay) }));
+          const mealsPicked = pickMeals(mealsEachDay, used, i);
+          const meals = mealsPicked.map((m) => ({ type: m.type, name: m.name, spiciness: m.spiciness, perPersonCalories: Math.round(merged.dailyCalorieGoal / mealsEachDay) }));
           const familySwaps = meals.map((m) => {
-            const exclude = new Set([m.name.toLowerCase(), ...names.map((x) => x.toLowerCase())]);
+            const exclude = new Set([m.name.toLowerCase(), ...mealsPicked.map((x) => x.name.toLowerCase())]);
             const perUser = profiles.map((p) => ({
               userId: p.userId,
               swaps: generateAlternatives(p, p.favorites, mealBank, pantryBoost, exclude, 3),
