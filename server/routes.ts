@@ -23,6 +23,7 @@ type UserProfile = {
 };
 
 const userProfilesById = new Map<number, UserProfile>();
+const conversationsById = new Map<string, { messages: { role: "user" | "assistant"; content: string }[]; currentPlan?: any }>();
 
 function getOrCreateUserProfile(userId: number): UserProfile {
   const existing = userProfilesById.get(userId);
@@ -116,6 +117,51 @@ export async function registerRoutes(app: Express): Promise<void> {
   // Pantry list
   app.get("/api/pantry", (_req: Request, res: Response) => {
     res.json({ items: inMemoryPantry });
+  });
+
+  // --- Chat memory endpoints ---
+  app.post("/api/chat/message", async (req: Request, res: Response) => {
+    const { conversationId, message } = req.body as { conversationId?: string; message?: string };
+    if (!conversationId || !message) return res.status(400).json({ message: "conversationId and message required" });
+    const convo = conversationsById.get(conversationId) ?? { messages: [] };
+    convo.messages.push({ role: "user", content: message });
+
+    // Build context
+    const context = convo.messages.slice(-20); // last 20 exchanges
+    const openai = getOpenAIClient();
+    let assistantReply = "";
+    if (openai) {
+      try {
+        const response = await openai.chat.completions.create({
+          model: "gpt-4o-mini",
+          messages: [
+            { role: "system", content: "You are a helpful meal planning assistant. Honor and reference prior messages to interpret follow-ups." },
+            ...context.map((m) => ({ role: m.role, content: m.content } as const)),
+          ],
+          temperature: 0.4,
+        });
+        assistantReply = response.choices?.[0]?.message?.content ?? "";
+      } catch (err) {
+        log(`openai chat failed: ${String(err)}`);
+      }
+    }
+
+    if (!assistantReply) {
+      // Fallback: simple rule-based memory acknowledgement
+      const lastUser = context.findLast?.((m) => m.role === "user")?.content ?? message;
+      assistantReply = `Got it. You said: "${lastUser}". I will adjust your current plan accordingly.`;
+    }
+
+    convo.messages.push({ role: "assistant", content: assistantReply });
+    conversationsById.set(conversationId, convo);
+    res.json({ success: true, reply: assistantReply, conversation: convo });
+  });
+
+  app.post("/api/chat/clear", (req: Request, res: Response) => {
+    const { conversationId } = req.body as { conversationId?: string };
+    if (!conversationId) return res.status(400).json({ message: "conversationId required" });
+    conversationsById.delete(conversationId);
+    res.json({ success: true });
   });
 
   // Meal planner options
@@ -252,7 +298,7 @@ export async function registerRoutes(app: Express): Promise<void> {
   // --- Meal Planner ---
   app.post("/api/meal-plan/generate", async (req: Request, res: Response) => {
     try {
-      const { userId, userIds, days, mealsPerDay, mealTypes, spiciness, cuisine } = req.body as {
+      const { userId, userIds, days, mealsPerDay, mealTypes, spiciness, cuisine, conversationId } = req.body as {
         userId?: number;
         userIds?: number[];
         days?: number;
@@ -260,6 +306,7 @@ export async function registerRoutes(app: Express): Promise<void> {
         mealTypes?: string[];
         spiciness?: "Mild" | "Medium" | "Hot";
         cuisine?: string;
+        conversationId?: string;
       };
       const audience = Array.isArray(userIds) && userIds.length > 0 ? userIds.map(Number) : [Number(userId)];
       if (!audience.length || audience.some((id) => !id || Number.isNaN(id))) return res.status(400).json({ message: "userId or userIds required" });
@@ -397,6 +444,11 @@ Return STRICT JSON with shape: [{"day":1, "meals":[{"type":"breakfast|lunch|dinn
         });
       }
 
+      if (conversationId) {
+        const convo = conversationsById.get(conversationId) ?? { messages: [] };
+        convo.currentPlan = plan;
+        conversationsById.set(conversationId, convo);
+      }
       res.json({ success: true, plan });
     } catch (error: any) {
       res.status(500).json({ message: error?.message ?? "meal plan generation failed" });
@@ -440,6 +492,44 @@ Return STRICT JSON with shape: [{"day":1, "meals":[{"type":"breakfast|lunch|dinn
     const exclude = new Set<string>([mealName.toLowerCase()]);
     const swaps = generateAlternatives(profile, profile.favorites, mealBank, pantryBoost, exclude, 5);
     res.json({ success: true, swaps });
+  });
+
+  // --- Sync current plan into a conversation (when generated on client) ---
+  app.post("/api/meal-plan/sync", (req: Request, res: Response) => {
+    const { conversationId, plan } = req.body as { conversationId?: string; plan?: any };
+    if (!conversationId || !plan) return res.status(400).json({ message: "conversationId and plan required" });
+    const convo = conversationsById.get(conversationId) ?? { messages: [] };
+    convo.currentPlan = plan;
+    conversationsById.set(conversationId, convo);
+    res.json({ success: true });
+  });
+
+  // --- Adjust current plan based on conversation ---
+  app.post("/api/meal-plan/adjust", (req: Request, res: Response) => {
+    const { conversationId, instruction } = req.body as { conversationId?: string; instruction?: string };
+    if (!conversationId || !instruction) return res.status(400).json({ message: "conversationId and instruction required" });
+    const convo = conversationsById.get(conversationId);
+    if (!convo?.currentPlan) return res.status(404).json({ message: "no current plan for conversation" });
+
+    // Naive adjuster: replace one meal if user says "change" something
+    const plan = JSON.parse(JSON.stringify(convo.currentPlan));
+    const lower = instruction.toLowerCase();
+    // Find first meal that matches a mentioned keyword to change
+    let changed = false;
+    for (const day of plan) {
+      for (const meal of day.meals) {
+        if (lower.includes("change") || lower.includes("swap") || lower.includes(meal.name.toLowerCase())) {
+          meal.name = meal.name.includes("salad") ? "Tofu stir-fry" : "Quinoa bowl with roasted vegetables";
+          changed = true;
+          break;
+        }
+      }
+      if (changed) break;
+    }
+
+    convo.currentPlan = plan;
+    conversationsById.set(conversationId, convo);
+    res.json({ success: true, plan });
   });
 
   return;
