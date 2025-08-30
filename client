@@ -13,14 +13,14 @@
     
     <!-- Open Graph / Facebook -->
     <meta property="og:type" content="website" />
-    <meta property="og:url" content="https://savviwell-platform.replit.app/" />
+    <meta property="og:url" content="https://co2030.github.io/savviwell-platform/" />
     <meta property="og:title" content="Savviwell Platform - AI Nutrition Assistant" />
     <meta property="og:description" content="Smart meal planning, pantry management, and personalized nutrition guidance powered by AI." />
     <meta property="og:image" content="/og-image.png" />
     
     <!-- Twitter -->
     <meta property="twitter:card" content="summary_large_image" />
-    <meta property="twitter:url" content="https://savviwell-platform.replit.app/" />
+    <meta property="twitter:url" content="https://co2030.github.io/savviwell-platform/" />
     <meta property="twitter:title" content="Savviwell Platform - AI Nutrition Assistant" />
     <meta property="twitter:description" content="Smart meal planning, pantry management, and personalized nutrition guidance powered by AI." />
     <meta property="twitter:image" content="/twitter-image.png" />
