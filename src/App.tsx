@@ -29,9 +29,7 @@ function AppRouter() {
 
 function App() {
   return (
-    <div style={{ padding: 20, fontFamily: 'Arial, sans-serif' }}>
-      <h1>Savviwell Platform</h1>
-      <p>React app is working!</p>
+    <div className="min-h-screen bg-gradient-to-br from-blue-50 via-white to-green-50">
       <QueryClientProvider client={queryClient}>
         <TooltipProvider>
           <Toaster />
