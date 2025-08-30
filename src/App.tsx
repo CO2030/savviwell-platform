@@ -29,7 +29,7 @@ function AppRouter() {
 
 function App() {
   return (
-    <div className="min-h-screen bg-gradient-to-br from-blue-50 via-white to-green-50">
+    <div className="min-h-screen bg-gradient-to-br from-slate-50 via-white to-purple-50">
       <QueryClientProvider client={queryClient}>
         <TooltipProvider>
           <Toaster />
