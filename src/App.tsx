@@ -10,6 +10,7 @@ import PantryPage from "@/pages/pantry";
 import NotFound from "@/pages/not-found";
 
 function Router() {
+  console.log('Router rendering, current path:', window.location.pathname);
   return (
     <Switch>
       <Route path="/" component={VoiceAssistantPage} />
@@ -26,6 +27,7 @@ function App() {
     <div style={{ padding: 20, fontFamily: 'Arial, sans-serif' }}>
       <h1>Savviwell Platform</h1>
       <p>React app is working!</p>
+      <p>Current path: {window.location.pathname}</p>
       <QueryClientProvider client={queryClient}>
         <TooltipProvider>
           <Toaster />
